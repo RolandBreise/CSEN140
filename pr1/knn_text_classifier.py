@@ -3,29 +3,43 @@
 News abstract text classification with a custom k-NN classifier.
 
 Allowed libraries:
-  - scikit-learn: TfidfVectorizer, preprocessing.normalize, train_test_split, f1_score
-  - scipy.sparse: sparse TF-IDF matrices
+  - scikit-learn: TfidfVectorizer, TruncatedSVD, chi2, preprocessing.normalize,
+    train_test_split, f1_score
+  - scipy.sparse: sparse BM25 / TF-IDF matrices
   - nltk: stemming / lemmatization / stopwords (optional)
   - numpy: vectorized neighbor search on batched similarity blocks
 
 The k-NN implementation itself is written here (no sklearn.neighbors).
+
+Strong accuracy-oriented pipeline (see pr1/p1.ipynb): rich tokens (punct strip, stem,
+stopwords, synthetic word n-grams), BM25 or sublinear TF-IDF, optional chi-squared
+feature selection, optional LSI (SVD), weighted voting with --sim-power.
+Multi-representation ensembles and PRF from the notebook are not ported (very heavy).
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import re
+import string
 import sys
 import warnings
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy import sparse
+from scipy.sparse import csr_matrix, diags
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_selection import chi2
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize
+
+SparseOrDense = Union[sparse.csr_matrix, np.ndarray]
 
 # -----------------------------------------------------------------------------
 # NLTK (optional pieces loaded lazily)
@@ -101,6 +115,175 @@ def preprocess_texts(
 
 
 # -----------------------------------------------------------------------------
+# Notebook-style representation (BM25 / sublinear TF-IDF / chi2 / LSI)
+# -----------------------------------------------------------------------------
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def preprocess_rich(raw: str, *, include_trigrams: bool = True) -> List[str]:
+    """
+    Lowercase, strip punctuation, remove English stopwords, Porter-stem words,
+    then emit unigrams + underscore bigrams (+ optional trigrams).
+    Matches the core token pipeline from p1.ipynb (without GPU-specific parts).
+    """
+    _ensure_nltk_data()
+    from nltk.corpus import stopwords
+    from nltk.stem import PorterStemmer
+
+    global _STEMMER
+    if _STEMMER is None:
+        _STEMMER = PorterStemmer()
+    sw = set(stopwords.words("english"))
+
+    text = raw.lower().translate(_PUNCT_TABLE)
+    unigrams = [_STEMMER.stem(t) for t in text.split() if t not in sw and len(t) > 1]
+    bigrams = [f"{unigrams[i]}_{unigrams[i + 1]}" for i in range(len(unigrams) - 1)]
+    toks = unigrams + bigrams
+    if include_trigrams:
+        tri = [
+            f"{unigrams[i]}_{unigrams[i + 1]}_{unigrams[i + 2]}"
+            for i in range(len(unigrams) - 2)
+        ]
+        toks.extend(tri)
+    return toks
+
+
+def preprocess_rich_corpus(texts: Sequence[str], *, include_trigrams: bool = True) -> List[List[str]]:
+    return [preprocess_rich(t, include_trigrams=include_trigrams) for t in texts]
+
+
+def renormalize(mat: csr_matrix) -> csr_matrix:
+    """L2-normalize each row of a sparse matrix (cosine k-NN on dot product)."""
+    norms = np.sqrt(mat.multiply(mat).sum(axis=1)).A1.astype(np.float64)
+    norms[norms == 0] = 1.0
+    return diags(1.0 / norms) @ mat
+
+
+def build_vocab_idf(
+    token_lists: Sequence[Sequence[str]],
+    *,
+    min_df: int,
+    max_vocab: int,
+    idf_mode: Literal["bm25", "tfidf"],
+) -> Tuple[dict, np.ndarray, defaultdict]:
+    """Vocabulary + IDF weights from training token lists (df filtered, top terms by df)."""
+    N = len(token_lists)
+    doc_freq: defaultdict[str, int] = defaultdict(int)
+    for toks in token_lists:
+        for t in set(toks):
+            doc_freq[t] += 1
+    terms = sorted([(t, df) for t, df in doc_freq.items() if df >= min_df], key=lambda x: -x[1])[:max_vocab]
+    vocab = {t: i for i, (t, _) in enumerate(terms)}
+    idf = np.zeros(len(vocab), dtype=np.float32)
+    for t, idx in vocab.items():
+        df = doc_freq[t]
+        if idf_mode == "bm25":
+            idf[idx] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+        else:
+            idf[idx] = math.log((N + 1) / (df + 1)) + 1
+    return vocab, idf, doc_freq
+
+
+def build_bm25_matrix(
+    token_lists: Sequence[Sequence[str]],
+    vocab: dict,
+    idf: np.ndarray,
+    k1: float,
+    b: float,
+    avgdl: float,
+) -> csr_matrix:
+    rows: List[int] = []
+    cols: List[int] = []
+    vals: List[float] = []
+    for doc_idx, tokens in enumerate(token_lists):
+        if not tokens:
+            continue
+        tf_counts = Counter(tokens)
+        doc_len = len(tokens)
+        for term, tf in tf_counts.items():
+            if term not in vocab:
+                continue
+            col = vocab[term]
+            score = idf[col] * tf * (k1 + 1) / (tf + k1 * (1 - b + b * doc_len / avgdl))
+            rows.append(doc_idx)
+            cols.append(col)
+            vals.append(float(score))
+    mat = csr_matrix((vals, (rows, cols)), shape=(len(token_lists), len(vocab)), dtype=np.float32)
+    return renormalize(mat)
+
+
+def build_sublinear_tfidf_matrix(token_lists: Sequence[Sequence[str]], vocab: dict, idf: np.ndarray) -> csr_matrix:
+    """Notebook-style sublinear TF * IDF / doc length, then row L2-normalize."""
+    rows: List[int] = []
+    cols: List[int] = []
+    vals: List[float] = []
+    for doc_idx, tokens in enumerate(token_lists):
+        if not tokens:
+            continue
+        tf_counts = Counter(tokens)
+        total = len(tokens)
+        for term, count in tf_counts.items():
+            if term not in vocab:
+                continue
+            col = vocab[term]
+            val = (1 + math.log(count)) / total * idf[col]
+            rows.append(doc_idx)
+            cols.append(col)
+            vals.append(float(val))
+    mat = csr_matrix((vals, (rows, cols)), shape=(len(token_lists), len(vocab)), dtype=np.float32)
+    return renormalize(mat)
+
+
+def apply_chi2_selection(
+    train_mat: csr_matrix,
+    labels: Sequence[int],
+    k: int,
+    test_mat: Optional[csr_matrix] = None,
+) -> Tuple[csr_matrix, Optional[csr_matrix]]:
+    """Select top-k features by chi-squared vs. labels; re-normalize rows."""
+    y = np.asarray(labels, dtype=np.int64)
+    scores, _ = chi2(train_mat, y)
+    k_eff = min(k, train_mat.shape[1])
+    top = np.argsort(scores)[-k_eff:]
+    top.sort()
+    tr = renormalize(train_mat[:, top].tocsr())
+    if test_mat is None:
+        return tr, None
+    return tr, renormalize(test_mat[:, top].tocsr())
+
+
+def l2_normalize_dense(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (mat / norms).astype(np.float32)
+
+
+def apply_lsi(
+    X_train: csr_matrix,
+    X_test: Optional[csr_matrix],
+    *,
+    n_components: int,
+    random_state: int,
+    n_iter: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """TruncatedSVD + row L2 normalization (dense cosine k-NN), as in p1.ipynb LSI models."""
+    n_comp = min(n_components, X_train.shape[1] - 1, X_train.shape[0] - 1)
+    n_comp = max(n_comp, 1)
+    svd = TruncatedSVD(
+        n_components=n_comp,
+        random_state=random_state,
+        algorithm="randomized",
+        n_iter=n_iter,
+    )
+    Xt = l2_normalize_dense(svd.fit_transform(X_train))
+    if X_test is None:
+        return Xt, None
+    Xv = l2_normalize_dense(svd.transform(X_test))
+    return Xt, Xv
+
+
+# -----------------------------------------------------------------------------
 # Data I/O
 # -----------------------------------------------------------------------------
 
@@ -146,12 +329,13 @@ Voting = Literal["majority", "weighted"]
 
 class CustomKNNClassifier:
     """
-    k-NN for high-dimensional sparse features.
+    k-NN for sparse TF-IDF/BM25 or dense LSI features.
 
-    - Cosine: rows are L2-normalized; similarity is sparse-dense dot product per batch.
-    - Euclidean: squared distances via ||x||^2 + ||y||^2 - 2 x·y (vectorized per batch).
+    - Sparse cosine: L2-normalized rows; dot product = cosine similarity.
+    - Sparse Euclidean: squared distances via norms and dot products.
+    - Dense cosine (e.g. after TruncatedSVD): batched matrix multiply.
 
-    Labels are assumed to be integers in {1, 2, 3, 4}.
+    Labels are integers in {1, 2, 3, 4}. Optional sim_power sharpens weighted votes (p1.ipynb).
     """
 
     def __init__(
@@ -160,6 +344,7 @@ class CustomKNNClassifier:
         metric: Metric = "cosine",
         voting: Voting = "majority",
         batch_size: int = 2048,
+        sim_power: float = 1.0,
     ) -> None:
         if k < 1:
             raise ValueError("k must be >= 1")
@@ -167,33 +352,48 @@ class CustomKNNClassifier:
         self.metric = metric
         self.voting = voting
         self.batch_size = batch_size
-        self._X_train: Optional[sparse.csr_matrix] = None
+        self.sim_power = sim_power
+        self._X_train_sparse: Optional[sparse.csr_matrix] = None
+        self._X_train_dense: Optional[np.ndarray] = None
         self._y_train: Optional[np.ndarray] = None
         self._train_norm_sq: Optional[np.ndarray] = None
 
-    def fit(self, X_train: sparse.csr_matrix, y_train: Sequence[int]) -> "CustomKNNClassifier":
-        self._X_train = X_train.tocsr()
+    def fit(self, X_train: SparseOrDense, y_train: Sequence[int]) -> "CustomKNNClassifier":
         self._y_train = np.asarray(y_train, dtype=np.int64)
+        if isinstance(X_train, np.ndarray):
+            if self.metric == "euclidean":
+                raise ValueError("Dense Euclidean k-NN is not implemented; use cosine + LSI or sparse features.")
+            self._X_train_dense = np.asarray(X_train, dtype=np.float32)
+            self._X_train_sparse = None
+            self._train_norm_sq = None
+            return self
+
+        self._X_train_dense = None
+        self._X_train_sparse = X_train.tocsr()
         if self.metric == "cosine":
-            self._X_train = normalize(self._X_train, norm="l2", axis=1)
-        # Precompute squared row norms for Euclidean distance
+            self._X_train_sparse = normalize(self._X_train_sparse, norm="l2", axis=1)
         if self.metric == "euclidean":
-            x = self._X_train.astype(np.float64, copy=False)
+            x = self._X_train_sparse.astype(np.float64, copy=False)
             self._train_norm_sq = np.asarray(x.multiply(x).sum(axis=1)).ravel()
         else:
             self._train_norm_sq = None
         return self
 
-    def predict(self, X: sparse.csr_matrix) -> np.ndarray:
-        if self._X_train is None or self._y_train is None:
+    def predict(self, X: SparseOrDense) -> np.ndarray:
+        if self._y_train is None:
             raise RuntimeError("Call fit() before predict().")
+        if isinstance(X, np.ndarray):
+            return self._predict_dense_cosine(np.asarray(X, dtype=np.float32))
 
         X = X.tocsr()
+        if self._X_train_sparse is None:
+            raise RuntimeError("Internal error: sparse predict without sparse training matrix.")
+
         n = X.shape[0]
         preds = np.empty(n, dtype=np.int64)
-        Xt = self._X_train
+        Xt = self._X_train_sparse
         y = self._y_train
-        k = min(self.k, Xt.shape[0])
+        k_eff = min(self.k, Xt.shape[0])
 
         if self.metric == "cosine":
             Xn = normalize(X, norm="l2", axis=1)
@@ -201,7 +401,7 @@ class CustomKNNClassifier:
                 end = min(start + self.batch_size, n)
                 block = Xn[start:end] @ Xt.T
                 sims = block.toarray() if sparse.issparse(block) else np.asarray(block)
-                self._predict_block_from_similarity(sims, y, k, preds, start)
+                self._predict_block_from_similarity(sims, y, k_eff, preds, start)
         else:
             x64 = X.astype(np.float64, copy=False)
             chunk_norm_sq = np.asarray(x64.multiply(x64).sum(axis=1)).ravel()
@@ -214,9 +414,25 @@ class CustomKNNClassifier:
                 dots = block.toarray() if sparse.issparse(block) else np.asarray(block)
                 cns = chunk_norm_sq[start:end][:, None]
                 dist2 = np.maximum(cns + train_norm_sq[None, :] - 2.0 * dots, 0.0)
-                # k smallest distances
-                self._predict_block_from_distance(dist2, y, k, preds, start)
+                self._predict_block_from_distance(dist2, y, k_eff, preds, start)
 
+        return preds
+
+    def _predict_dense_cosine(self, X: np.ndarray) -> np.ndarray:
+        """Cosine k-NN on row-L2-normalized dense matrices."""
+        if self._X_train_dense is None:
+            raise RuntimeError("Internal error: dense predict without dense training matrix.")
+        tr = self._X_train_dense
+        y = self._y_train
+        assert y is not None
+        n = X.shape[0]
+        preds = np.empty(n, dtype=np.int64)
+        k_eff = min(self.k, tr.shape[0])
+        Xn = l2_normalize_dense(X)
+        for start in range(0, n, self.batch_size):
+            end = min(start + self.batch_size, n)
+            sims = Xn[start:end] @ tr.T
+            self._predict_block_from_similarity(np.asarray(sims, dtype=np.float64), y, k_eff, preds, start)
         return preds
 
     def _predict_block_from_similarity(
@@ -235,7 +451,7 @@ class CustomKNNClassifier:
             if self.voting == "majority":
                 preds[offset + i] = self._majority_vote(neigh_y)
             else:
-                w = row[idx]
+                w = row[idx].astype(np.float64)
                 preds[offset + i] = self._weighted_vote(neigh_y, w)
 
     def _predict_block_from_distance(
@@ -255,18 +471,16 @@ class CustomKNNClassifier:
             else:
                 d = np.sqrt(np.maximum(row[idx], 0.0))
                 w = 1.0 / (d + 1e-9)
-                preds[offset + i] = self._weighted_vote(neigh_y, w)
+                preds[offset + i] = self._weighted_vote(neigh_y, w.astype(np.float64))
 
-    @staticmethod
-    def _majority_vote(neigh_y: np.ndarray) -> int:
-        # Labels 1..4
+    def _majority_vote(self, neigh_y: np.ndarray) -> int:
         counts = np.bincount(neigh_y, minlength=5)
         c = counts[1:5]
-        # tie-break toward smaller class id for reproducibility
         return int(np.argmax(c) + 1)
 
-    @staticmethod
-    def _weighted_vote(neigh_y: np.ndarray, weights: np.ndarray) -> int:
+    def _weighted_vote(self, neigh_y: np.ndarray, weights: np.ndarray) -> int:
+        if self.sim_power != 1.0:
+            weights = np.power(np.maximum(weights, 0.0), self.sim_power)
         score = np.zeros(5, dtype=np.float64)
         for cls, w in zip(neigh_y, weights):
             score[int(cls)] += float(w)
@@ -305,7 +519,7 @@ def build_vectorizer(
 
 
 def run_validation(
-    X: sparse.csr_matrix,
+    X: SparseOrDense,
     y: List[int],
     *,
     val_size: float,
@@ -314,6 +528,7 @@ def run_validation(
     metric: Metric,
     voting: Voting,
     batch_size: int,
+    sim_power: float,
 ) -> float:
     y_arr = np.asarray(y, dtype=np.int64)
     idx = np.arange(X.shape[0])
@@ -323,13 +538,19 @@ def run_validation(
         random_state=random_state,
         stratify=y_arr,
     )
-    X_tr = X[tr_idx]
+    X_fit = X[tr_idx]
     X_va = X[va_idx]
     y_tr = y_arr[tr_idx]
     y_va = y_arr[va_idx]
 
-    knn = CustomKNNClassifier(k=k, metric=metric, voting=voting, batch_size=batch_size)
-    knn.fit(X_tr, y_tr)
+    knn = CustomKNNClassifier(
+        k=k,
+        metric=metric,
+        voting=voting,
+        batch_size=batch_size,
+        sim_power=sim_power,
+    )
+    knn.fit(X_fit, y_tr)
     pred = knn.predict(X_va)
     return float(f1_score(y_va, pred, average="macro"))
 
@@ -365,14 +586,44 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--test", type=Path, default=here / "test.dat")
     p.add_argument("--output", type=Path, default=here / "predictions.dat")
 
+    p.add_argument(
+        "--pipeline",
+        choices=("sklearn", "bm25", "sublinear"),
+        default="bm25",
+        help="sklearn=TfidfVectorizer on simple preprocess; bm25/sublinear = p1.ipynb-style rich tokens + custom weighting.",
+    )
+    p.add_argument("--no-trigrams", action="store_true", help="Rich pipeline: uni+bigrams only (drop synthetic trigrams).")
+    p.add_argument("--max-vocab", type=int, default=150_000, help="Max vocabulary size after min_df filtering (rich pipelines).")
+    p.add_argument(
+        "--chi2-k",
+        type=int,
+        default=120_000,
+        help="Retain top-K features by chi-squared vs. labels (0 = disable). Inspired by p1.ipynb.",
+    )
+    p.add_argument("--bm25-k1", type=float, default=1.2, help="BM25 k1 (notebook grid favored ~1.2).")
+    p.add_argument("--bm25-b", type=float, default=0.5, help="BM25 b (notebook grid favored ~0.5).")
+    p.add_argument(
+        "--lsi-components",
+        type=int,
+        default=0,
+        help="If >0, apply TruncatedSVD then dense cosine k-NN (requires --metric cosine).",
+    )
+    p.add_argument("--svd-iter", type=int, default=7, help="Iterations for randomized TruncatedSVD.")
+
     p.add_argument("--k", type=int, default=15)
     p.add_argument("--metric", choices=("cosine", "euclidean"), default="cosine")
     p.add_argument("--voting", choices=("majority", "weighted"), default="majority")
+    p.add_argument(
+        "--sim-power",
+        type=float,
+        default=1.0,
+        help="Raise neighbor similarity weights to this power (weighted voting only; try 2.0 per p1.ipynb).",
+    )
     p.add_argument("--batch-size", type=int, default=2048)
 
     p.add_argument("--use-stemmer", action="store_true")
     p.add_argument("--use-lemma", action="store_true")
-    p.add_argument("--no-stopwords", action="store_true", help="Do not remove English stopwords.")
+    p.add_argument("--no-stopwords", action="store_true", help="Sklearn pipeline only: do not remove English stopwords.")
 
     p.add_argument("--max-features", type=int, default=None)
     p.add_argument("--ngram-min", type=int, default=1)
@@ -408,30 +659,80 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Missing test file: {test_path}", file=sys.stderr)
         return 2
 
+    if args.pipeline != "sklearn" and args.lsi_components > 0 and args.metric != "cosine":
+        print("LSI requires cosine similarity; use --metric cosine.", file=sys.stderr)
+        return 2
+
     texts_tr, y_tr_list = load_train(train_path)
     if args.max_train_samples is not None:
         texts_tr = texts_tr[: args.max_train_samples]
         y_tr_list = y_tr_list[: args.max_train_samples]
 
-    remove_stop = not args.no_stopwords
-    texts_tr_pp = preprocess_texts(
-        texts_tr,
-        use_stemmer=args.use_stemmer,
-        use_lemma=args.use_lemma,
-        remove_stopwords=remove_stop,
-    )
-
-    vec = build_vectorizer(
-        max_features=args.max_features,
-        ngram_range=(args.ngram_min, args.ngram_max),
-        min_df=args.min_df,
-        sublinear_tf=args.sublinear_tf,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=UserWarning)
-        X_tr = vec.fit_transform(texts_tr_pp).tocsr()
-
     y_tr = np.asarray(y_tr_list, dtype=np.int64)
+    X_te: Optional[Union[csr_matrix, np.ndarray]] = None
+
+    if args.pipeline == "sklearn":
+        remove_stop = not args.no_stopwords
+        texts_tr_pp = preprocess_texts(
+            texts_tr,
+            use_stemmer=args.use_stemmer,
+            use_lemma=args.use_lemma,
+            remove_stopwords=remove_stop,
+        )
+        vec = build_vectorizer(
+            max_features=args.max_features,
+            ngram_range=(args.ngram_min, args.ngram_max),
+            min_df=args.min_df,
+            sublinear_tf=args.sublinear_tf,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            X_tr = vec.fit_transform(texts_tr_pp).tocsr()
+        if not args.val_only:
+            texts_te = load_test(test_path)
+            texts_te_pp = preprocess_texts(
+                texts_te,
+                use_stemmer=args.use_stemmer,
+                use_lemma=args.use_lemma,
+                remove_stopwords=remove_stop,
+            )
+            X_te = vec.transform(texts_te_pp).tocsr()
+    else:
+        include_tri = not args.no_trigrams
+        tokens_tr = preprocess_rich_corpus(texts_tr, include_trigrams=include_tri)
+        idf_mode: Literal["bm25", "tfidf"] = "bm25" if args.pipeline == "bm25" else "tfidf"
+        vocab, idf, _ = build_vocab_idf(
+            tokens_tr,
+            min_df=args.min_df,
+            max_vocab=args.max_vocab,
+            idf_mode=idf_mode,
+        )
+        avgdl = float(np.mean([len(t) for t in tokens_tr])) if tokens_tr else 1.0
+
+        if args.pipeline == "bm25":
+            X_tr = build_bm25_matrix(tokens_tr, vocab, idf, args.bm25_k1, args.bm25_b, avgdl)
+        else:
+            X_tr = build_sublinear_tfidf_matrix(tokens_tr, vocab, idf)
+
+        if not args.val_only:
+            texts_te = load_test(test_path)
+            tokens_te = preprocess_rich_corpus(texts_te, include_trigrams=include_tri)
+            if args.pipeline == "bm25":
+                X_te = build_bm25_matrix(tokens_te, vocab, idf, args.bm25_k1, args.bm25_b, avgdl)
+            else:
+                X_te = build_sublinear_tfidf_matrix(tokens_te, vocab, idf)
+
+        if args.chi2_k > 0:
+            X_tr, X_te = apply_chi2_selection(X_tr, y_tr_list, args.chi2_k, X_te)
+
+        if args.lsi_components > 0:
+            X_tr, X_te = apply_lsi(
+                X_tr,
+                X_te,
+                n_components=args.lsi_components,
+                random_state=args.random_state,
+                n_iter=args.svd_iter,
+            )
 
     if not args.skip_val:
         f1 = run_validation(
@@ -443,26 +744,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             metric=args.metric,
             voting=args.voting,
             batch_size=args.batch_size,
+            sim_power=args.sim_power,
         )
         print(f"Validation macro-F1 (stratified holdout, val_size={args.val_size}): {f1:.4f}")
 
     if args.val_only:
         return 0
 
-    texts_te = load_test(test_path)
-    texts_te_pp = preprocess_texts(
-        texts_te,
-        use_stemmer=args.use_stemmer,
-        use_lemma=args.use_lemma,
-        remove_stopwords=remove_stop,
-    )
-    X_te = vec.transform(texts_te_pp).tocsr()
+    assert X_te is not None
 
     knn = CustomKNNClassifier(
         k=args.k,
         metric=args.metric,
         voting=args.voting,
         batch_size=args.batch_size,
+        sim_power=args.sim_power,
     )
     knn.fit(X_tr, y_tr)
     pred_te = knn.predict(X_te)
